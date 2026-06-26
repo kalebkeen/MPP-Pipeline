@@ -1,0 +1,5 @@
+Run  Build-Setup batch file
+
+Launch the newly created MPP-Pipeline-Setup exe
+
+Install
