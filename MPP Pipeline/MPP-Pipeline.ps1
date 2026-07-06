@@ -64,10 +64,18 @@ function Get-FileScore {
     if ($Rules.Count -eq 0) { return 1 }   # no rules = everything rank 1
 
     $matchScope = { param($rule, $path, $name)
+        # Match against the name/path WITHOUT the file extension. Every file is
+        # ".mpp", so the extension carries no filtering signal — and leaving it
+        # in makes single-letter schedule-version keywords (K, M, …) always
+        # match the "m" in ".mpp".
+        $nameNoExt = [System.IO.Path]::GetFileNameWithoutExtension($name)
+        $dir       = [System.IO.Path]::GetDirectoryName($path)
+        $pathNoExt = if ([string]::IsNullOrEmpty($dir)) { $nameNoExt }
+                     else { [System.IO.Path]::Combine($dir, $nameNoExt) }
         $target = switch ($rule.Scope) {
-            'Filename'  { $name }
-            'Full Path' { $path }
-            default     { "$path $name" }
+            'Filename'  { $nameNoExt }
+            'Full Path' { $pathNoExt }
+            default     { "$pathNoExt $nameNoExt" }
         }
         return ($target -imatch [regex]::Escape($rule.Keyword))
     }
