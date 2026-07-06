@@ -1,4 +1,4 @@
-# =============================================================================
+﻿# =============================================================================
 # MPP-Pipeline.ps1
 # Unified GUI tool: Filter → Preview → Export MPP files to XML
 #
@@ -134,10 +134,43 @@ function Invoke-Scan {
         $excludeList = $ExcludeFoldersCsv -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
     }
 
-    $allFiles = Get-ChildItem -Path $SourcePath -Recurse -Filter "*.mpp" -ErrorAction SilentlyContinue |
-                Where-Object { -not $_.PSIsContainer }
+    # Manual paced walk instead of one big Get-ChildItem -Recurse burst:
+    #  - excluded folders are pruned BEFORE descending, so the share never
+    #    traverses them at all
+    #  - a short pause between directories keeps the metadata requests from
+    #    monopolizing the shared drive
+    $allFiles    = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+    $dirQueue    = [System.Collections.Generic.Queue[string]]::new()
+    $dirQueue.Enqueue($SourcePath)
+    $dirsScanned = 0
+    while ($dirQueue.Count -gt 0) {
+        $dir = $dirQueue.Dequeue()
 
-    # Apply folder exclusions
+        $skipDir = $false
+        foreach ($ex in $excludeList) {
+            if ($dir -imatch [regex]::Escape($ex)) { $skipDir = $true; break }
+        }
+        if ($skipDir) { continue }
+
+        try {
+            foreach ($fp in [System.IO.Directory]::EnumerateFiles($dir, '*.mpp')) {
+                $allFiles.Add([System.IO.FileInfo]::new($fp))
+            }
+            foreach ($dp in [System.IO.Directory]::EnumerateDirectories($dir)) {
+                $dirQueue.Enqueue($dp)
+            }
+        } catch { }   # unreadable folder (permissions, path length) — skip it
+
+        $dirsScanned++
+        if (($dirsScanned % 5) -eq 0) {
+            $lblPreviewSummary.Text = "Scanning… ($dirsScanned folders, $($allFiles.Count) MPP files)"
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+        Start-Sleep -Milliseconds 150
+    }
+
+    # Apply folder exclusions (second pass catches filename-level matches;
+    # whole excluded folders were already pruned during the walk above)
     $workingFiles = foreach ($f in $allFiles) {
         $excluded = $false
         foreach ($ex in $excludeList) {
@@ -248,6 +281,57 @@ function Set-XmlStatusDate {
     } catch {}
 }
 
+# =============================================================================
+# HELPER: Local staging — MS Project must never read/write over the network.
+# Staged copies are keyed by source path + size + timestamp, so a file staged
+# during Preview (status-date read) is re-used during Export without a second
+# network copy.
+# =============================================================================
+$script:StagingDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'MPP Pipeline\staging'
+
+function Clear-StagingDir {
+    try {
+        if (Test-Path -LiteralPath $script:StagingDir) {
+            Remove-Item -LiteralPath $script:StagingDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
+}
+
+function Get-StagedCopy {
+    param([string]$SourcePath)
+
+    if (-not (Test-Path -LiteralPath $script:StagingDir)) {
+        New-Item -ItemType Directory -Path $script:StagingDir -Force | Out-Null
+    }
+
+    $fi  = [System.IO.FileInfo]::new($SourcePath)
+    $sig = '{0}|{1}|{2}' -f $SourcePath.ToLowerInvariant(), $fi.LastWriteTimeUtc.Ticks, $fi.Length
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    try {
+        $hash = ([System.BitConverter]::ToString($md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($sig))) -replace '-','').Substring(0,12)
+    } finally { $md5.Dispose() }
+
+    $staged = Join-Path $script:StagingDir ('{0}_{1}.mpp' -f [System.IO.Path]::GetFileNameWithoutExtension($SourcePath), $hash)
+    if (Test-Path -LiteralPath $staged) {
+        return @{ Path = $staged; Copied = $false }
+    }
+    Copy-Item -LiteralPath $SourcePath -Destination $staged -Force
+    return @{ Path = $staged; Copied = $true }
+}
+
+function Invoke-PacedPause {
+    # Sleeps N seconds while keeping the UI responsive; the point is to leave
+    # the shared drive idle between network operations so other users' requests
+    # get through.
+    param([int]$Seconds, [bool]$RespectCancel = $true)
+    if ($Seconds -le 0) { return }
+    $until = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $until) {
+        if ($RespectCancel -and $script:ExportCancelled) { return }
+        Start-Sleep -Milliseconds 200
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+}
 
 # =============================================================================
 # HELPER: Full shell folder picker (shows network drives + mapped drives)
@@ -804,9 +888,19 @@ function Read-StatusDates {
             $resolvedSource = ''
 
             # ── Tier 1: MS Project StatusDate field ───────────────────────────
+            $tier1Copied = $false
             try {
+                # Stage the file locally so MS Project never reads over the
+                # network; the staged copy is re-used by the Export stage.
+                $openPath = $entry.FilePath
+                try {
+                    $stage       = Get-StagedCopy -SourcePath $entry.FilePath
+                    $openPath    = $stage.Path
+                    $tier1Copied = $stage.Copied
+                } catch { }   # staging failed (source locked?) — open from source
+
                 $msp.DisplayAlerts = $false
-                $msp.FileOpen($entry.FilePath, $true) | Out-Null
+                $msp.FileOpen($openPath, $true) | Out-Null
                 Start-Sleep -Milliseconds 600
                 $sdRaw = $msp.ActiveProject.StatusDate
                 $msp.FileClose(0) | Out-Null
@@ -825,6 +919,12 @@ function Read-StatusDates {
                 }
             } catch {
                 try { $msp.FileClose(0) | Out-Null } catch { }
+            }
+
+            # Rest the shared drive between network copies (skipped when the
+            # file was already staged, since the share wasn't touched)
+            if ($tier1Copied -and $done -lt $total) {
+                Invoke-PacedPause -Seconds ([int]$nudPauseSec.Value) -RespectCancel $false
             }
 
             # ── Tier 2: Date from filename ────────────────────────────────────
@@ -1079,7 +1179,17 @@ $nudBatchSize.Width = 70; $nudBatchSize.Height = 24
 $nudBatchSize.Minimum = 10; $nudBatchSize.Maximum = 500; $nudBatchSize.Value = 100
 $gbExportOpts.Controls.Add($nudBatchSize)
 
-$lblBatchNote = New-Label 'MS Project restarts between batches to prevent memory leaks. Default 100 is safe for most systems.' 242 110 650 20
+$lblPauseSec = New-Label 'Pause between files (sec):' 250 108 170
+$lblPauseSec.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$gbExportOpts.Controls.Add($lblPauseSec)
+
+$nudPauseSec = New-Object System.Windows.Forms.NumericUpDown
+$nudPauseSec.Left = 424; $nudPauseSec.Top = 106
+$nudPauseSec.Width = 60; $nudPauseSec.Height = 24
+$nudPauseSec.Minimum = 0; $nudPauseSec.Maximum = 60; $nudPauseSec.Value = 3
+$gbExportOpts.Controls.Add($nudPauseSec)
+
+$lblBatchNote = New-Label 'Batch restarts prevent memory leaks. The pause rests the shared drive between file copies.' 500 110 410 20
 $lblBatchNote.ForeColor = [System.Drawing.Color]::Gray
 $lblBatchNote.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
 $gbExportOpts.Controls.Add($lblBatchNote)
@@ -1230,11 +1340,19 @@ $btnStartExport.Add_Click({
     }
 
     $batchSize     = [int]$nudBatchSize.Value
+    $pauseSec      = [int]$nudPauseSec.Value
     $startTime     = Get-Date
     $batchNum      = 0
     $fileIndex     = 0
 
+    # Staging dir must exist even if an individual Get-StagedCopy fails —
+    # the XML is always written locally first, then moved to the destination.
+    if (-not (Test-Path -LiteralPath $script:StagingDir)) {
+        New-Item -ItemType Directory -Path $script:StagingDir -Force | Out-Null
+    }
+
     Write-Log "Batch size: $batchSize files per MS Project session" ([System.Drawing.Color]::FromArgb(150,220,255))
+    Write-Log "Pause between files: ${pauseSec}s  |  Staging: $($script:StagingDir)" ([System.Drawing.Color]::FromArgb(150,220,255))
 
     Write-Log 'Launching MS Project COM…'
     $msp = Start-MSProject
@@ -1270,9 +1388,27 @@ $btnStartExport.Add_Click({
         $srcFile   = $entry.FilePath
         $baseName  = [System.IO.Path]::GetFileNameWithoutExtension($entry.FileName)
         # All XML files go flat into the single dated run folder
-        $outFile = Join-Path $destPath "$baseName.xml"
+        $outFile  = Join-Path $destPath "$baseName.xml"
+        # MS Project reads/writes only local paths; the XML is moved to the
+        # destination after the file is closed.
+        $localXml = Join-Path $script:StagingDir "$baseName.xml"
 
         Write-Log "Exporting: $($entry.FileName)"
+
+        # Stage the MPP locally — one sequential read of the share instead of
+        # MS Project's random-access I/O over the network
+        $openPath = $srcFile
+        try {
+            $stage    = Get-StagedCopy -SourcePath $srcFile
+            $openPath = $stage.Path
+            if ($stage.Copied) {
+                Write-Log "  Staged locally." ([System.Drawing.Color]::FromArgb(150,150,150))
+            } else {
+                Write-Log "  Re-using copy staged during Preview." ([System.Drawing.Color]::FromArgb(150,150,150))
+            }
+        } catch {
+            Write-Log "  Could not stage locally ($($_.Exception.Message)) — opening from source." ([System.Drawing.Color]::FromArgb(255,200,80))
+        }
 
         $maxRetries = 5
         $attempt    = 0
@@ -1282,7 +1418,7 @@ $btnStartExport.Add_Click({
             $attempt++
             try {
                 $msp.DisplayAlerts = $false
-                $msp.FileOpen($srcFile, $true) | Out-Null
+                $msp.FileOpen($openPath, $true) | Out-Null
                 Start-Sleep -Milliseconds 900
 
                 # Read status date from MPP if needed
@@ -1324,17 +1460,17 @@ $btnStartExport.Add_Click({
                     }
                 }
 
-                $msp.FileSaveAs($outFile) | Out-Null
+                $msp.FileSaveAs($localXml) | Out-Null
                 Start-Sleep -Milliseconds 500
                 $msp.FileClose(0) | Out-Null
 
-                if (Test-Path $outFile) {
-                    # Inject status date into XML
+                if (Test-Path $localXml) {
+                    # Inject status date into XML (still local — no network I/O)
                     if ($useStatusDate -and $effectiveSD -ne '') {
-                        Set-XmlStatusDate -XmlPath $outFile -StatusDate $effectiveSD
+                        Set-XmlStatusDate -XmlPath $localXml -StatusDate $effectiveSD
                         # Verify the date actually landed in the XML
                         try {
-                            [xml]$verifyDoc = Get-Content -LiteralPath $outFile -Encoding UTF8
+                            [xml]$verifyDoc = Get-Content -LiteralPath $localXml -Encoding UTF8
                             $nsm2 = New-Object System.Xml.XmlNamespaceManager($verifyDoc.NameTable)
                             $nsm2.AddNamespace('p','http://schemas.microsoft.com/project')
                             $verifyNode = $verifyDoc.SelectSingleNode('//p:StatusDate', $nsm2)
@@ -1347,10 +1483,12 @@ $btnStartExport.Add_Click({
                             Write-Log "  Could not verify status date in XML." ([System.Drawing.Color]::Gray)
                         }
                     }
+                    # One sequential write to the destination
+                    Move-Item -LiteralPath $localXml -Destination $outFile -Force
                     $success = $true
                     Write-Log "  → $outFile" ([System.Drawing.Color]::FromArgb(100,255,100))
                 } else {
-                    throw "Output file not created: $outFile"
+                    throw "Output file not created: $localXml"
                 }
 
             } catch {
@@ -1390,6 +1528,11 @@ $btnStartExport.Add_Click({
         $lblETA.Text       = "ETA: $etaStr"
         $lblErrors.Text    = "Errors: $errorCount"
         [System.Windows.Forms.Application]::DoEvents()
+
+        # Rest the shared drive between files
+        if ($pauseSec -gt 0 -and $processedCount -lt $toExport.Count) {
+            Invoke-PacedPause -Seconds $pauseSec
+        }
     }
 
     # ── Final cleanup ─────────────────────────────────────────────────────
@@ -1421,9 +1564,12 @@ $btnCancelExport.Add_Click({
 # =============================================================================
 # LAUNCH
 # =============================================================================
+Clear-StagingDir   # remove staged copies left over from a previous session
+
 $form.Add_Shown({
     $tabs.Dock = [System.Windows.Forms.DockStyle]::Fill
     $form.Refresh()
     $form.Activate()
 })
+$form.Add_FormClosed({ Clear-StagingDir })
 [System.Windows.Forms.Application]::Run($form)
