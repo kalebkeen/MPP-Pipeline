@@ -92,7 +92,13 @@ function Get-FileScore {
                 if (-not (& $matchScope $r $FullPath $FileName)) { $allMatch = $false; break }
             }
             if ($allMatch) {
-                $minRank = ($groupRules | Measure-Object -Property Priority -Minimum).Minimum
+                # Manual min over hashtable keys — Measure-Object -Property does
+                # NOT see hashtable keys as properties and throws under StrictMode
+                # (this is the AND-group path; OR below already reads .Priority directly)
+                $minRank = [int]::MaxValue
+                foreach ($gr in $groupRules) {
+                    if ($gr.Priority -lt $minRank) { $minRank = $gr.Priority }
+                }
                 if ($minRank -lt $bestRank) { $bestRank = $minRank }
             }
         } else {
