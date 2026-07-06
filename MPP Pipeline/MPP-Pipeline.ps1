@@ -74,6 +74,7 @@ function Get-FileScore {
                      else { [System.IO.Path]::Combine($dir, $nameNoExt) }
         $target = switch ($rule.Scope) {
             'Filename'  { $nameNoExt }
+            'Folder'    { $dir }        # directory path only — matches any ancestor folder name
             'Full Path' { $pathNoExt }
             default     { "$pathNoExt $nameNoExt" }
         }
@@ -596,7 +597,7 @@ $gbAddRule.Controls.Add((New-Label 'Scope:' 650 28 48))
 $cboScope = New-Object System.Windows.Forms.ComboBox
 $cboScope.Left = 698; $cboScope.Top = 26; $cboScope.Width = 100
 $cboScope.DropDownStyle = 'DropDownList'
-$cboScope.Items.AddRange(@('Filename','Full Path','Both')) | Out-Null
+$cboScope.Items.AddRange(@('Filename','Folder','Full Path','Both')) | Out-Null
 $cboScope.SelectedIndex = 0
 $gbAddRule.Controls.Add($cboScope)
 
@@ -605,7 +606,7 @@ $btnAddRule = New-Btn '+ Add Rule' 812 22 140 30 ([System.Drawing.Color]::FromAr
 $gbAddRule.Controls.Add($btnAddRule)
 
 # Row 2: note label
-$lblGroupNote = New-Label 'AND Group ID only matters when Logic = AND. Rules with the same Group ID must ALL match.' 10 62 940 20
+$lblGroupNote = New-Label 'AND Group ID only matters when Logic = AND. Rules with the same Group ID must ALL match. Tip: combine a Folder rule + a Filename rule in one AND group to filter filenames within specific folders.' 10 62 960 20
 $lblGroupNote.ForeColor = [System.Drawing.Color]::Gray
 $gbAddRule.Controls.Add($lblGroupNote)
 
