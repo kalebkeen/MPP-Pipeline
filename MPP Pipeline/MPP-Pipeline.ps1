@@ -1662,22 +1662,38 @@ $btnStartExport.Add_Click({
                     # (master-file convention: the schedule name never changes,
                     # only the folder does), so naming the XML after the base name
                     # alone makes each snapshot overwrite the previous one.
-                    # Compose  <base> <status-date> <parent-folder>.xml  so that
-                    # weeks are separated by date and same-week stages (K / M /
-                    # Meeting) by folder. De-collide against names already written
-                    # THIS run so a distinct snapshot is never lost, while a same-
-                    # day re-run cleanly overwrites its own prior output.
+                    # Compose  <base> <parent-folder> <date>.xml  — folder
+                    # separates same-week stages (K / M / Meeting), date separates
+                    # weeks. The date is GUARANTEED: folder names repeat every
+                    # week ("Meeting file" etc.), so without a date the weeks
+                    # would still collide. Fallback chain: status date resolved at
+                    # export → status date read during Preview → date parsed from
+                    # the filename → the SOURCE file's last-save time (the share
+                    # copy carries the scheduler's real save date; only exported
+                    # XML mtimes get re-stamped). De-collide against names already
+                    # written THIS run so a distinct snapshot is never lost, while
+                    # a same-day re-run cleanly overwrites its own prior output.
                     $dateTok = ''
                     if ($effectiveSD -ne '') {
                         $dateTok = $effectiveSD
                     } elseif ($entry.StatusDate -and "$($entry.StatusDate)".Trim() -ne '') {
                         $dateTok = "$($entry.StatusDate)".Trim()
+                    } else {
+                        $fnd = Get-FilenameDate -BaseName $baseName
+                        if ($null -ne $fnd) {
+                            $dateTok = $fnd.ToString('yyyy-MM-dd')
+                        } else {
+                            try {
+                                $dateTok = (Get-Item -LiteralPath $srcFile -ErrorAction Stop).LastWriteTime.ToString('yyyy-MM-dd')
+                                Write-Log "  Output name date from file's last-save time: $dateTok" ([System.Drawing.Color]::FromArgb(150,150,150))
+                            } catch { }
+                        }
                     }
                     $folderTok = ''
                     try { $folderTok = [System.IO.Path]::GetFileName("$($entry.Folder)") } catch { }
                     $stemParts = @($baseName)
-                    if ($dateTok   -ne '') { $stemParts += $dateTok }
                     if ($folderTok -ne '') { $stemParts += $folderTok }
+                    if ($dateTok   -ne '') { $stemParts += $dateTok }
                     $stem    = ($stemParts -join ' ') -replace '[\\/:*?"<>|]', '_'
                     $stemKey = $stem.ToLower()
                     if ($usedStems.ContainsKey($stemKey)) {
