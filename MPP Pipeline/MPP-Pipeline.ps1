@@ -611,7 +611,7 @@ $lblGroupNote.ForeColor = [System.Drawing.Color]::Gray
 $gbAddRule.Controls.Add($lblGroupNote)
 
 # ── Rules grid ────────────────────────────────────────────────────────────
-$gbRules = New-GroupBox 'Current Rules  (select row + use buttons to edit)' 12 172 970 308
+$gbRules = New-GroupBox 'Current Rules  (click a cell to edit in place; select row + side buttons to reorder / delete)' 12 172 970 308
 $tabFilter.Controls.Add($gbRules)
 
 $dgvRules = New-Object System.Windows.Forms.DataGridView
@@ -625,22 +625,99 @@ $dgvRules.RowHeadersVisible     = $false
 $dgvRules.AutoSizeColumnsMode   = 'Fill'
 $dgvRules.BackgroundColor       = [System.Drawing.Color]::White
 $dgvRules.BorderStyle           = 'None'
-$dgvRules.ReadOnly              = $true
+# Cells are editable in place: Logic/Scope get dropdowns, Priority/GroupID are
+# validated numerics, Keyword is free text. Edits write straight back into
+# $script:FilterRules (see CellValueChanged below).
+$dgvRules.ReadOnly              = $false
+$dgvRules.EditMode              = 'EditOnEnter'
 
 foreach ($col in @(
-    @{Name='Priority'; Header='Priority'; FillW=60},
-    @{Name='Keyword';  Header='Keyword';  FillW=200},
-    @{Name='Logic';    Header='Logic';    FillW=50},
-    @{Name='GroupID';  Header='AND Grp';  FillW=55},
-    @{Name='Scope';    Header='Scope';    FillW=80}
+    @{Name='Priority'; Header='Priority'; FillW=60;  Combo=$null},
+    @{Name='Keyword';  Header='Keyword';  FillW=200; Combo=$null},
+    @{Name='Logic';    Header='Logic';    FillW=50;  Combo=@('OR','AND')},
+    @{Name='GroupID';  Header='AND Grp';  FillW=55;  Combo=$null},
+    @{Name='Scope';    Header='Scope';    FillW=80;  Combo=@('Filename','Folder','Full Path','Both')}
 )) {
-    $c = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    if ($null -ne $col.Combo) {
+        $c = New-Object System.Windows.Forms.DataGridViewComboBoxColumn
+        foreach ($it in $col.Combo) { [void]$c.Items.Add($it) }
+        $c.FlatStyle = 'Flat'
+    } else {
+        $c = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    }
     $c.Name = $col.Name; $c.HeaderText = $col.Header
     $c.FillWeight = $col.FillW
     $dgvRules.Columns.Add($c) | Out-Null
 }
 
 $gbRules.Controls.Add($dgvRules)
+
+# Guard flag: suppress the write-back handler while the grid is being rebuilt
+$script:RulesGridLoading = $false
+
+# Commit combo-box picks immediately so CellValueChanged fires on selection
+# instead of waiting for the cell to lose focus
+$dgvRules.Add_CurrentCellDirtyStateChanged({
+    if ($dgvRules.IsCurrentCellDirty) {
+        $dgvRules.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit)
+    }
+})
+# Swallow grid data errors (e.g. a legacy value not in a dropdown's item list)
+$dgvRules.Add_DataError({ param($s, $e) $e.ThrowException = $false })
+
+$dgvRules.Add_CellValueChanged({
+    param($s, $e)
+    if ($script:RulesGridLoading) { return }
+    if ($e.RowIndex -lt 0 -or $e.RowIndex -ge $script:FilterRules.Count) { return }
+    if ($e.ColumnIndex -lt 0) { return }
+    $rule    = $script:FilterRules[$e.RowIndex]
+    $colName = $dgvRules.Columns[$e.ColumnIndex].Name
+    $raw     = $dgvRules.Rows[$e.RowIndex].Cells[$e.ColumnIndex].Value
+
+    # Reverts the cell to the stored value without re-triggering this handler
+    $revert = {
+        param($value)
+        $script:RulesGridLoading = $true
+        $dgvRules.Rows[$e.RowIndex].Cells[$e.ColumnIndex].Value = $value
+        $script:RulesGridLoading = $false
+    }
+
+    switch ($colName) {
+        'Priority' {
+            $n = 0
+            if ([int]::TryParse("$raw", [ref]$n) -and $n -ge 1 -and $n -le 999) {
+                $rule.Priority = $n
+            } else {
+                [System.Windows.Forms.MessageBox]::Show('Priority must be a number from 1 to 999.','Edit Rule',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning)
+                & $revert $rule.Priority
+            }
+        }
+        'Keyword' {
+            $k = "$raw".Trim()
+            if ($k -ne '') {
+                $rule.Keyword = $k
+            } else {
+                [System.Windows.Forms.MessageBox]::Show('Keyword cannot be empty.','Edit Rule',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning)
+                & $revert $rule.Keyword
+            }
+        }
+        'Logic' {
+            if ("$raw" -in @('OR','AND')) { $rule.Logic = "$raw" }
+        }
+        'GroupID' {
+            $n = 0
+            if ([int]::TryParse("$raw", [ref]$n) -and $n -ge 1 -and $n -le 99) {
+                $rule.GroupID = $n
+            } else {
+                [System.Windows.Forms.MessageBox]::Show('AND Group ID must be a number from 1 to 99.','Edit Rule',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning)
+                & $revert $rule.GroupID
+            }
+        }
+        'Scope' {
+            if ("$raw" -in @('Filename','Folder','Full Path','Both')) { $rule.Scope = "$raw" }
+        }
+    }
+})
 
 # Side buttons for rules
 $btnRuleUp     = New-Btn '▲ Up'      886 30  76 28
@@ -653,10 +730,12 @@ $gbRules.Controls.Add($btnRuleDelete)
 $gbRules.Controls.Add($btnRuleClear)
 
 function Refresh-RulesGrid {
+    $script:RulesGridLoading = $true
     $dgvRules.Rows.Clear()
     foreach ($r in $script:FilterRules) {
         $dgvRules.Rows.Add($r.Priority, $r.Keyword, $r.Logic, $r.GroupID, $r.Scope) | Out-Null
     }
+    $script:RulesGridLoading = $false
 }
 
 $btnAddRule.Add_Click({
@@ -723,7 +802,7 @@ $tabFilter.Controls.Add($btnScan)
 
 # ── Save / Load rule sets ─────────────────────────────────────────────────
 # ── In-app rule set save/load panel ──────────────────────────────────────
-$gbRuleSets = New-GroupBox 'Saved Rule Sets  (in-app, session only)' 12 490 970 64
+$gbRuleSets = New-GroupBox 'Saved Rule Sets  (stored on this PC — available in every session)' 12 490 970 64
 $tabFilter.Controls.Add($gbRuleSets)
 
 $lblRSName = New-Label 'Name:' 8 28 40
@@ -756,6 +835,58 @@ function Refresh-RuleSetsDropdown {
         $cboRuleSets.Items.Add($k) | Out-Null
     }
     if ($cboRuleSets.Items.Count -gt 0) { $cboRuleSets.SelectedIndex = 0 }
+}
+
+# ── Rule set persistence ──────────────────────────────────────────────────
+# Rule sets survive across sessions in a JSON file next to the staging dir.
+$script:RuleSetsPath = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'MPP Pipeline\rulesets.json'
+
+function Save-RuleSetsToDisk {
+    try {
+        $dir = Split-Path -Parent $script:RuleSetsPath
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        $out = @{}
+        foreach ($k in $script:SavedRuleSets.Keys) {
+            $rules = @()
+            foreach ($r in $script:SavedRuleSets[$k]) {
+                $rules += @{
+                    Priority = [int]$r.Priority
+                    Keyword  = [string]$r.Keyword
+                    Logic    = [string]$r.Logic
+                    GroupID  = [int]$r.GroupID
+                    Scope    = [string]$r.Scope
+                }
+            }
+            $out[$k] = $rules
+        }
+        $json = ConvertTo-Json -InputObject $out -Depth 5
+        # UTF-8 no BOM so any external reader parses it cleanly
+        [System.IO.File]::WriteAllText($script:RuleSetsPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Could not save rule sets to disk: $($_.Exception.Message)",'Rule Sets',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning)
+    }
+}
+
+function Load-RuleSetsFromDisk {
+    if (-not (Test-Path -LiteralPath $script:RuleSetsPath)) { return }
+    try {
+        $data = [System.IO.File]::ReadAllText($script:RuleSetsPath) | ConvertFrom-Json
+        foreach ($prop in $data.PSObject.Properties) {
+            $copy = [System.Collections.Generic.List[hashtable]]::new()
+            foreach ($r in @($prop.Value)) {
+                $copy.Add(@{
+                    Priority = [int]$r.Priority
+                    Keyword  = [string]$r.Keyword
+                    Logic    = [string]$r.Logic
+                    GroupID  = [int]$r.GroupID
+                    Scope    = [string]$r.Scope
+                })
+            }
+            $script:SavedRuleSets[$prop.Name] = $copy
+        }
+    } catch { }   # unreadable/corrupted file — start with an empty collection rather than crash
 }
 
 # =============================================================================
@@ -1202,11 +1333,12 @@ $btnSaveRules.Add_Click({
         })
     }
     $script:SavedRuleSets[$name] = $copy
+    Save-RuleSetsToDisk
     Refresh-RuleSetsDropdown
     # Select the one we just saved
     $idx = $cboRuleSets.Items.IndexOf($name)
     if ($idx -ge 0) { $cboRuleSets.SelectedIndex = $idx }
-    [System.Windows.Forms.MessageBox]::Show("Saved $($copy.Count) rule(s) as '$name'.",'Saved',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information)
+    [System.Windows.Forms.MessageBox]::Show("Saved $($copy.Count) rule(s) as '$name'. It will be available in future sessions.",'Saved',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information)
 })
 
 $btnLoadRules.Add_Click({
@@ -1246,6 +1378,7 @@ $btnDeleteRS.Add_Click({
         [System.Windows.Forms.MessageBoxIcon]::Warning)
     if ($ans -eq 'Yes') {
         $script:SavedRuleSets.Remove($name) | Out-Null
+        Save-RuleSetsToDisk
         Refresh-RuleSetsDropdown
     }
 })
@@ -1790,6 +1923,8 @@ $btnCancelExport.Add_Click({
 # LAUNCH
 # =============================================================================
 Clear-StagingDir   # remove staged copies left over from a previous session
+Load-RuleSetsFromDisk      # restore rule sets saved in previous sessions
+Refresh-RuleSetsDropdown
 
 $form.Add_Shown({
     $tabs.Dock = [System.Windows.Forms.DockStyle]::Fill
