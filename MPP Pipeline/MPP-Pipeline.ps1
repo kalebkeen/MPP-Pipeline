@@ -861,6 +861,144 @@ function Get-FilenameDate {
 }
 
 # =============================================================================
+# HELPER: MS Project modal-dialog watchdog
+# =============================================================================
+# Schedules saved while an INTERACTIVE filter was active (e.g. the built-in
+# "Date Range" filter) re-prompt for the filter's parameters DURING FileOpen —
+# a modal dialog that DisplayAlerts=$false does NOT suppress, so unattended
+# opens hung forever. While the main thread is blocked inside a COM call, a
+# background runspace scans for visible dialogs owned by WINPROJ.EXE — MS
+# Project's own prompts use its custom "JWinproj-MLSDialog" window class
+# (verified live: the Date Range prompt is one), standard Office alerts use
+# "#32770" — and dismisses them with Esc (these are windowless-control
+# dialogs: no Button children to click, and they IGNORE WM_CLOSE; Esc is
+# what cancels them — verified live against the real Date Range prompt),
+# escalating through fallbacks if a dialog ignores it. Cancelling the
+# prompt is safe for exports: filters only change the on-screen VIEW —
+# FileSaveAs always writes every task to the XML. The watchdog only acts while
+# Armed, and Armed is set tightly around this app's own COM calls, so it can
+# never touch a dialog the user opened themselves.
+
+$script:WatchdogShared = [hashtable]::Synchronized(@{
+    Stop  = $false
+    Armed = $false
+    Log   = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+})
+$script:DialogWatchdog = $null
+
+function Start-MppDialogWatchdog {
+    if ($null -ne $script:DialogWatchdog) { return }
+    $script:WatchdogShared.Stop  = $false
+    $script:WatchdogShared.Armed = $false
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript({
+        param($Shared)
+        if (-not ('MppWd.Native' -as [type])) {
+            # NOTE: window discovery must use EnumWindows + GetClassName, NOT
+            # FindWindowEx by class name — FindWindowEx never matches MS
+            # Project's custom "JWinproj-MLSDialog" class (verified live: the
+            # FindWindowEx variant hung on the real Date Range prompt, the
+            # EnumWindows variant dismissed it immediately).
+            Add-Type -Namespace MppWd -Name Native -MemberDefinition @'
+[DllImport("user32.dll")]
+public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
+public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+[DllImport("user32.dll")]
+public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+[DllImport("user32.dll")]
+public static extern bool IsWindowVisible(IntPtr hWnd);
+[DllImport("user32.dll", CharSet=CharSet.Unicode)]
+public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+[DllImport("user32.dll", CharSet=CharSet.Unicode)]
+public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+[DllImport("user32.dll")]
+public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+'@
+        }
+        $WM_KEYDOWN    = 0x0100
+        $WM_KEYUP      = 0x0101
+        $VK_ESCAPE     = 0x1B
+        $WM_COMMAND    = 0x0111
+        $IDCANCEL      = 2
+        $WM_CLOSE      = 0x0010
+        $WM_SYSCOMMAND = 0x0112
+        $SC_CLOSE      = 0xF060
+        $attempts = @{}   # hwnd -> dismissal attempts, drives the escalation
+        while (-not $Shared.Stop) {
+            if ($Shared.Armed) {
+                $projPids = @{}
+                foreach ($p in @(Get-Process -Name WINPROJ -ErrorAction SilentlyContinue)) {
+                    $projPids[[uint32]$p.Id] = $true
+                }
+                if ($projPids.Count -gt 0) {
+                    # Collect candidate dialogs: visible, owned by WINPROJ, of a
+                    # known prompt class. EnumWindows is required — see NOTE above.
+                    $dialogs = New-Object System.Collections.ArrayList
+                    $cb = [MppWd.Native+EnumWindowsProc]{
+                        param($hWnd, $lParam)
+                        $wpid = [uint32]0
+                        [void][MppWd.Native]::GetWindowThreadProcessId($hWnd, [ref]$wpid)
+                        if ($projPids.ContainsKey($wpid) -and [MppWd.Native]::IsWindowVisible($hWnd)) {
+                            $cn = New-Object System.Text.StringBuilder 128
+                            [void][MppWd.Native]::GetClassName($hWnd, $cn, 128)
+                            if ($cn.ToString() -eq 'JWinproj-MLSDialog' -or $cn.ToString() -eq '#32770') {
+                                $tn = New-Object System.Text.StringBuilder 256
+                                [void][MppWd.Native]::GetWindowText($hWnd, $tn, 256)
+                                [void]$dialogs.Add(@{ H = $hWnd; Title = $tn.ToString() })
+                            }
+                        }
+                        return $true
+                    }
+                    [void][MppWd.Native]::EnumWindows($cb, [IntPtr]::Zero)
+                    foreach ($dlg in $dialogs) {
+                        $hDlg  = $dlg.H
+                        $title = $dlg.Title
+                        # Esc first (verified dismisser of the Date Range prompt);
+                        # if the same dialog survives to a later tick, walk
+                        # through the fallbacks.
+                        $key = "$hDlg"
+                        $n = 0
+                        if ($attempts.ContainsKey($key)) { $n = [int]$attempts[$key] }
+                        $attempts[$key] = $n + 1
+                        switch ($n % 4) {
+                            0 { [void][MppWd.Native]::PostMessage($hDlg, $WM_KEYDOWN, [IntPtr]$VK_ESCAPE, [IntPtr]::Zero)
+                                [void][MppWd.Native]::PostMessage($hDlg, $WM_KEYUP,   [IntPtr]$VK_ESCAPE, [IntPtr]::Zero) }
+                            1 { [void][MppWd.Native]::PostMessage($hDlg, $WM_COMMAND, [IntPtr]$IDCANCEL, [IntPtr]::Zero) }
+                            2 { [void][MppWd.Native]::PostMessage($hDlg, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) }
+                            3 { [void][MppWd.Native]::PostMessage($hDlg, $WM_SYSCOMMAND, [IntPtr]$SC_CLOSE, [IntPtr]::Zero) }
+                        }
+                        if ($n -eq 0) {
+                            [void]$Shared.Log.Add("Auto-dismissed MS Project prompt '$title' (sent Esc — the file's saved interactive filter was skipped)")
+                        }
+                    }
+                }
+            }
+            Start-Sleep -Milliseconds 300
+        }
+    })
+    [void]$ps.AddArgument($script:WatchdogShared)
+    $script:DialogWatchdog = @{ PS = $ps; Handle = $ps.BeginInvoke() }
+}
+
+function Stop-MppDialogWatchdog {
+    if ($null -eq $script:DialogWatchdog) { return }
+    $script:WatchdogShared.Stop  = $true
+    $script:WatchdogShared.Armed = $false
+    try { [void]$script:DialogWatchdog.PS.EndInvoke($script:DialogWatchdog.Handle) } catch { }
+    try { $script:DialogWatchdog.PS.Dispose() } catch { }
+    $script:DialogWatchdog = $null
+}
+
+function Write-WatchdogEvents {
+    # Drain dismissal notices recorded by the background watchdog into the log
+    while ($script:WatchdogShared.Log.Count -gt 0) {
+        $msg = [string]$script:WatchdogShared.Log[0]
+        $script:WatchdogShared.Log.RemoveAt(0)
+        Write-Log "  $msg" ([System.Drawing.Color]::FromArgb(255,200,80))
+    }
+}
+
+# =============================================================================
 # HELPER: Pre-read status dates using 3-tier fallback
 #   Tier 1: MS Project StatusDate field (Project Information)
 #   Tier 2: Date parsed from filename (flexible parser, sanity-checked)
@@ -891,6 +1029,10 @@ function Read-StatusDates {
             return
         }
 
+        # Guard against files saved with an interactive filter (Date Range etc.)
+        # whose parameter prompt would otherwise block FileOpen forever.
+        Start-MppDialogWatchdog
+
         $total = $script:SelectedFiles.Count
         $done  = 0
 
@@ -915,10 +1057,13 @@ function Read-StatusDates {
                 } catch { }   # staging failed (source locked?) — open from source
 
                 $msp.DisplayAlerts = $false
+                $script:WatchdogShared.Armed = $true
                 $msp.FileOpen($openPath, $true) | Out-Null
                 Start-Sleep -Milliseconds 600
                 $sdRaw = $msp.ActiveProject.StatusDate
                 $msp.FileClose(0) | Out-Null
+                $script:WatchdogShared.Armed = $false
+                Write-WatchdogEvents
 
                 if ($null -ne $sdRaw) {
                     $sdStr = "$sdRaw".Trim()
@@ -933,6 +1078,8 @@ function Read-StatusDates {
                     }
                 }
             } catch {
+                $script:WatchdogShared.Armed = $false
+                Write-WatchdogEvents
                 try { $msp.FileClose(0) | Out-Null } catch { }
             }
 
@@ -971,6 +1118,7 @@ function Read-StatusDates {
             }
         }
     } finally {
+        Stop-MppDialogWatchdog
         if ($null -ne $msp) {
             try {
                 $msp.Quit()
@@ -1381,6 +1529,9 @@ $btnStartExport.Add_Click({
         $btnCancelExport.Enabled = $false
         return
     }
+    # Guard against files saved with an interactive filter (Date Range etc.)
+    # whose parameter prompt would otherwise block FileOpen forever.
+    Start-MppDialogWatchdog
     $batchNum++
     $batchCount = 0
     Write-Log "Batch 1 started." ([System.Drawing.Color]::FromArgb(150,220,255))
@@ -1437,6 +1588,8 @@ $btnStartExport.Add_Click({
             $attempt++
             try {
                 $msp.DisplayAlerts = $false
+                # Arm the dialog watchdog for this file's open→save→close span
+                $script:WatchdogShared.Armed = $true
                 $msp.FileOpen($openPath, $true) | Out-Null
                 Start-Sleep -Milliseconds 900
 
@@ -1482,6 +1635,8 @@ $btnStartExport.Add_Click({
                 $msp.FileSaveAs($localXml) | Out-Null
                 Start-Sleep -Milliseconds 500
                 $msp.FileClose(0) | Out-Null
+                $script:WatchdogShared.Armed = $false
+                Write-WatchdogEvents
 
                 if (Test-Path $localXml) {
                     # Inject status date into XML (still local — no network I/O)
@@ -1543,6 +1698,8 @@ $btnStartExport.Add_Click({
                 }
 
             } catch {
+                $script:WatchdogShared.Armed = $false
+                Write-WatchdogEvents
                 $msg = $_.Exception.Message
                 if ($msg -match 'RPC_E_CALL_REJECTED' -or $msg -match '0x80010001') {
                     Write-Log "  [Retry $attempt/$maxRetries] MS Project busy…" ([System.Drawing.Color]::FromArgb(255,200,80))
@@ -1587,6 +1744,7 @@ $btnStartExport.Add_Click({
     }
 
     # ── Final cleanup ─────────────────────────────────────────────────────
+    Stop-MppDialogWatchdog
     if ($null -ne $msp) { Stop-MSProject $msp }
 
     $elapsed = (Get-Date) - $startTime
