@@ -1359,6 +1359,10 @@ $btnStartExport.Add_Click({
     $startTime     = Get-Date
     $batchNum      = 0
     $fileIndex     = 0
+    # Tracks output stems already written THIS run so distinct snapshots that
+    # resolve to the same name get a numeric suffix instead of overwriting each
+    # other (see the naming block before Move-Item below).
+    $usedStems     = @{}
 
     # Staging dir must exist even if an individual Get-StagedCopy fails —
     # the XML is always written locally first, then moved to the destination.
@@ -1402,10 +1406,10 @@ $btnStartExport.Add_Click({
 
         $srcFile   = $entry.FilePath
         $baseName  = [System.IO.Path]::GetFileNameWithoutExtension($entry.FileName)
-        # All XML files go flat into the single dated run folder
-        $outFile  = Join-Path $destPath "$baseName.xml"
-        # MS Project reads/writes only local paths; the XML is moved to the
-        # destination after the file is closed.
+        # MS Project reads/writes only local paths, so the XML is staged locally
+        # under the source base name first. Its final, unique destination name is
+        # composed later (after the status date is read) to avoid same-name
+        # snapshots overwriting one another — see the naming block below.
         $localXml = Join-Path $script:StagingDir "$baseName.xml"
 
         Write-Log "Exporting: $($entry.FileName)"
@@ -1498,6 +1502,38 @@ $btnStartExport.Add_Click({
                             Write-Log "  Could not verify status date in XML." ([System.Drawing.Color]::Gray)
                         }
                     }
+                    # ── Compose a UNIQUE, informative output name ─────────────
+                    # Source filenames are often identical across snapshots
+                    # (master-file convention: the schedule name never changes,
+                    # only the folder does), so naming the XML after the base name
+                    # alone makes each snapshot overwrite the previous one.
+                    # Compose  <base> <status-date> <parent-folder>.xml  so that
+                    # weeks are separated by date and same-week stages (K / M /
+                    # Meeting) by folder. De-collide against names already written
+                    # THIS run so a distinct snapshot is never lost, while a same-
+                    # day re-run cleanly overwrites its own prior output.
+                    $dateTok = ''
+                    if ($effectiveSD -ne '') {
+                        $dateTok = $effectiveSD
+                    } elseif ($entry.StatusDate -and "$($entry.StatusDate)".Trim() -ne '') {
+                        $dateTok = "$($entry.StatusDate)".Trim()
+                    }
+                    $folderTok = ''
+                    try { $folderTok = [System.IO.Path]::GetFileName("$($entry.Folder)") } catch { }
+                    $stemParts = @($baseName)
+                    if ($dateTok   -ne '') { $stemParts += $dateTok }
+                    if ($folderTok -ne '') { $stemParts += $folderTok }
+                    $stem    = ($stemParts -join ' ') -replace '[\\/:*?"<>|]', '_'
+                    $stemKey = $stem.ToLower()
+                    if ($usedStems.ContainsKey($stemKey)) {
+                        $dupN = [int]$usedStems[$stemKey] + 1
+                        $usedStems[$stemKey] = $dupN
+                        $outFile = Join-Path $destPath ('{0} ({1}).xml' -f $stem, $dupN)
+                    } else {
+                        $usedStems[$stemKey] = 0
+                        $outFile = Join-Path $destPath ($stem + '.xml')
+                    }
+
                     # One sequential write to the destination
                     Move-Item -LiteralPath $localXml -Destination $outFile -Force
                     $success = $true
